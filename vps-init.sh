@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.1.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
@@ -753,6 +753,15 @@ port_is_listening() {
     ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
 }
 
+wait_for_port_listening() {
+    local port="$1" attempt
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        port_is_listening "$port" && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
 port_in_ephemeral_range() {
     local port="$1" low high
     if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
@@ -939,7 +948,7 @@ prepare_port_migration() {
         return 1
     fi
 
-    if ! reload_ssh yes || ! port_is_listening "$NEW_PORT"; then
+    if ! reload_ssh yes || ! wait_for_port_listening "$NEW_PORT"; then
         rollback_port_prepare_changes "$backup_dir" "$NEW_PORT" "$ufw_added"
         error "新端口没有正常监听，已经回滚。"
         return 1
@@ -990,7 +999,7 @@ finalize_port_migration() {
     backup_one "$FAIL2BAN_FILE" "$backup_dir"
     write_port_config "$new_port"
 
-    if ! sshd_test || ! reload_ssh yes || ! port_is_listening "$new_port"; then
+    if ! sshd_test || ! reload_ssh yes || ! wait_for_port_listening "$new_port"; then
         restore_one "$PORT_FILE" "$backup_dir"
         sshd_test && reload_ssh yes || true
         error "关闭旧端口时验证失败，已经恢复双端口配置。"
