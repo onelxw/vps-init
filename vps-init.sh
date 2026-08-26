@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
 BACKUP_ROOT="/var/backups/vps-init"
@@ -1078,9 +1078,9 @@ hardening_menu() {
     local choice
     while true; do
         clear 2>/dev/null || true
-        printf '--------------------------------------------------\n'
+        printf '%s\n' '--------------------------------------------------'
         printf '密钥登录与账号加固\n'
-        printf '--------------------------------------------------\n'
+        printf '%s\n' '--------------------------------------------------'
         printf '[1] 开始配置/修复\n'
         printf '[2] 检查当前配置\n'
         printf '[3] 添加或更新管理员公钥\n'
