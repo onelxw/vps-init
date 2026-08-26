@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 
-# VPS SSH security bootstrap tool
-# Supported targets: modern Debian/Ubuntu and Rocky/AlmaLinux installations
+# VPS security bootstrap and maintenance tool
+# Supported targets: modern Debian and Ubuntu installations
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="2.0.0"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
 BACKUP_ROOT="/var/backups/vps-init"
@@ -17,6 +18,21 @@ SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 HARDENING_FILE="${SSHD_DROPIN_DIR}/00-vps-hardening.conf"
 PORT_FILE="${SSHD_DROPIN_DIR}/01-vps-port.conf"
 FAIL2BAN_FILE="/etc/fail2ban/jail.d/sshd.local"
+
+MONITOR_LOG="/var/log/vps-init-monitor.log"
+NETWORK_CONF="/etc/sysctl.d/99-vps-init-network.conf"
+JOURNAL_CONF="/etc/systemd/journald.conf.d/60-vps-init-limits.conf"
+DOCKER_CONF="/etc/docker/daemon.json"
+ZRAM_CONF="/etc/default/zramswap"
+XANMOD_REPO_CONF="/etc/apt/sources.list.d/xanmod-release.list"
+XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+DISK_SWAP_FILE="/swapfile"
+FSTAB_FILE="/etc/fstab"
+MEMORY_CONF="/etc/sysctl.d/99-vps-init-memory.conf"
+
+OS_ID=""
+OS_NAME=""
+OS_CODENAME=""
 
 SSHD_BIN=""
 
@@ -34,6 +50,32 @@ require_root() {
     if [[ ${EUID} -ne 0 ]]; then
         error "请使用 root 用户运行此脚本。"
         printf '可以先执行：sudo -i\n'
+        exit 1
+    fi
+}
+
+load_supported_os() {
+    if [[ ! -r /etc/os-release ]]; then
+        error "无法读取 /etc/os-release。"
+        exit 1
+    fi
+
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_NAME="${PRETTY_NAME:-$OS_ID}"
+    OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+
+    case "$OS_ID" in
+        debian|ubuntu) ;;
+        *)
+            error "本脚本仅支持 Debian/Ubuntu；检测到：$OS_NAME"
+            exit 1
+            ;;
+    esac
+
+    if command -v pveversion >/dev/null 2>&1; then
+        error "检测到 Proxmox VE。为避免影响宿主内核和网络，本脚本不适配 PVE。"
         exit 1
     fi
 }
@@ -213,18 +255,13 @@ reload_ssh() {
 
 install_package() {
     local package="$1"
-    if command -v apt-get >/dev/null 2>&1; then
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
-        fi
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y "$package"
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y "$package"
-    else
-        error "不支持当前系统的包管理器。"
+    if ! command -v apt-get >/dev/null 2>&1; then
+        error "找不到 apt-get；本脚本仅支持 Debian/Ubuntu。"
         return 1
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
     fi
 }
 
@@ -327,8 +364,6 @@ configure_nopasswd_sudo() {
 
     if getent group sudo >/dev/null 2>&1; then
         usermod -aG sudo "$user"
-    elif getent group wheel >/dev/null 2>&1; then
-        usermod -aG wheel "$user"
     fi
 
     if command -v runuser >/dev/null 2>&1; then
@@ -648,15 +683,7 @@ configure_fail2ban() {
     local ports backup_dir
     if ! fail2ban_installed; then
         info "正在安装 Fail2ban..."
-        if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-            if ! install_package fail2ban; then
-                info "尝试安装 EPEL 后重试..."
-                install_package epel-release
-                install_package fail2ban
-            fi
-        else
-            install_package fail2ban
-        fi
+        install_package fail2ban
     fi
 
     ports="$(ports_csv)"
@@ -801,50 +828,6 @@ remove_ufw_port_if_added() {
     fi
 }
 
-selinux_ssh_port_has() {
-    local wanted="$1" type proto ranges item start end
-    command -v semanage >/dev/null 2>&1 || return 1
-    while read -r type proto ranges; do
-        [[ "$type" == ssh_port_t && "$proto" == tcp ]] || continue
-        ranges="${ranges//,/ }"
-        for item in $ranges; do
-            if [[ "$item" == *-* ]]; then
-                start="${item%-*}"
-                end="${item#*-}"
-                ((wanted >= start && wanted <= end)) && return 0
-            elif [[ "$item" =~ ^[0-9]+$ ]] && ((wanted == item)); then
-                return 0
-            fi
-        done
-    done < <(semanage port -l 2>/dev/null)
-    return 1
-}
-
-add_selinux_ssh_port() {
-    local port="$1"
-    if ! command -v getenforce >/dev/null 2>&1 || [[ "$(getenforce)" != Enforcing ]]; then
-        printf '0\n'
-        return 0
-    fi
-    if ! command -v semanage >/dev/null 2>&1; then
-        error "SELinux 正在强制模式运行，但系统没有 semanage。请先安装 policycoreutils-python-utils。"
-        return 1
-    fi
-    if selinux_ssh_port_has "$port"; then
-        printf '0\n'
-        return 0
-    fi
-    semanage port -a -t ssh_port_t -p tcp "$port"
-    printf '1\n'
-}
-
-remove_selinux_port_if_added() {
-    local port="$1" added="$2"
-    if [[ "$added" == 1 ]] && command -v semanage >/dev/null 2>&1; then
-        semanage port -d -t ssh_port_t -p tcp "$port" >/dev/null 2>&1 || true
-    fi
-}
-
 write_port_config() {
     local old_port="$1" new_port="${2:-}"
     if [[ -n "$new_port" ]]; then
@@ -863,7 +846,7 @@ EOF
 }
 
 rollback_port_prepare_changes() {
-    local backup_dir="$1" new_port="$2" ufw_added="$3" selinux_added="$4"
+    local backup_dir="$1" new_port="$2" ufw_added="$3"
     restore_one "$PORT_FILE" "$backup_dir" || true
     restore_one "$FAIL2BAN_FILE" "$backup_dir" || true
     sshd_test && reload_ssh yes || true
@@ -871,7 +854,6 @@ rollback_port_prepare_changes() {
         systemctl restart fail2ban 2>/dev/null || true
     fi
     remove_ufw_port_if_added "$new_port" "$ufw_added"
-    remove_selinux_port_if_added "$new_port" "$selinux_added"
 }
 
 choose_new_port() {
@@ -906,7 +888,7 @@ choose_new_port() {
 
 prepare_port_migration() {
     local mode="$1" stage unmanaged current_ports old_port backup_dir
-    local ufw_added=0 selinux_added=0 confirm
+    local ufw_added=0 confirm
 
     stage="$(state_get PORT_STAGE 2>/dev/null || true)"
     if [[ "$stage" == prepared ]]; then
@@ -931,11 +913,6 @@ prepare_port_migration() {
 
     choose_new_port "$mode" || return 0
 
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
-        error "检测到 firewalld 正在运行。此脚本不会安装或修改 firewalld，请先手动放行端口 ${NEW_PORT}。"
-        return 1
-    fi
-
     printf '\n请先在 VPS 厂商的安全组/云防火墙开放 TCP %s。\n' "$NEW_PORT"
     printf '脚本只能配置服务器本地，无法验证厂商安全组。\n'
     read -rp '确认已经开放？[y/N]：' confirm
@@ -954,27 +931,22 @@ prepare_port_migration() {
         warn "UFW 未启用，脚本没有安装或启用任何本地防火墙。"
     fi
 
-    if ! selinux_added="$(add_selinux_ssh_port "$NEW_PORT" | tail -n1)"; then
-        remove_ufw_port_if_added "$NEW_PORT" "$ufw_added"
-        return 1
-    fi
-
     write_port_config "$old_port" "$NEW_PORT"
 
     if ! sshd_test; then
-        rollback_port_prepare_changes "$backup_dir" "$NEW_PORT" "$ufw_added" "$selinux_added"
+        rollback_port_prepare_changes "$backup_dir" "$NEW_PORT" "$ufw_added"
         error "SSH 端口配置检查失败，已经回滚。"
         return 1
     fi
 
     if ! reload_ssh yes || ! port_is_listening "$NEW_PORT"; then
-        rollback_port_prepare_changes "$backup_dir" "$NEW_PORT" "$ufw_added" "$selinux_added"
+        rollback_port_prepare_changes "$backup_dir" "$NEW_PORT" "$ufw_added"
         error "新端口没有正常监听，已经回滚。"
         return 1
     fi
 
     if fail2ban_installed && ! sync_fail2ban_ports "${old_port},${NEW_PORT}"; then
-        rollback_port_prepare_changes "$backup_dir" "$NEW_PORT" "$ufw_added" "$selinux_added"
+        rollback_port_prepare_changes "$backup_dir" "$NEW_PORT" "$ufw_added"
         error "Fail2ban 端口同步失败，SSH 端口迁移已经回滚。"
         return 1
     fi
@@ -984,7 +956,6 @@ prepare_port_migration() {
     state_set SSH_NEW_PORT "$NEW_PORT"
     state_set LAST_PORT_BACKUP "$backup_dir"
     state_set UFW_NEW_RULE_ADDED "$ufw_added"
-    state_set SELINUX_NEW_PORT_ADDED "$selinux_added"
     printf '%s\n' "$NEW_PORT" > /root/ssh-port.txt
     chmod 600 /root/ssh-port.txt
 
@@ -1074,7 +1045,7 @@ show_port_status() {
 }
 
 rollback_prepared_port() {
-    local stage backup_dir new_port ufw_added selinux_added
+    local stage backup_dir new_port ufw_added
     stage="$(state_get PORT_STAGE 2>/dev/null || true)"
     if [[ "$stage" != prepared ]]; then
         warn "当前没有处于准备阶段的端口迁移。已完成的端口迁移不会自动回退，请重新选择手动指定端口进行安全迁移。"
@@ -1083,14 +1054,997 @@ rollback_prepared_port() {
     backup_dir="$(state_get LAST_PORT_BACKUP)"
     new_port="$(state_get SSH_NEW_PORT)"
     ufw_added="$(state_get UFW_NEW_RULE_ADDED 2>/dev/null || printf 0)"
-    selinux_added="$(state_get SELINUX_NEW_PORT_ADDED 2>/dev/null || printf 0)"
     read -rp '输入 ROLLBACK 确认取消本次端口迁移：' _confirm
     [[ "$_confirm" == ROLLBACK ]] || return 0
-    rollback_port_prepare_changes "$backup_dir" "$new_port" "$ufw_added" "$selinux_added"
-    for key in PORT_STAGE SSH_OLD_PORT SSH_NEW_PORT LAST_PORT_BACKUP UFW_NEW_RULE_ADDED SELINUX_NEW_PORT_ADDED; do
+    rollback_port_prepare_changes "$backup_dir" "$new_port" "$ufw_added"
+    for key in PORT_STAGE SSH_OLD_PORT SSH_NEW_PORT LAST_PORT_BACKUP UFW_NEW_RULE_ADDED; do
         state_unset "$key"
     done
     ok "端口迁移已回滚。"
+}
+
+maintenance_die() {
+    error "$*"
+    exit 1
+}
+
+maintenance_run() {
+    local status
+    set +e
+    (
+        set -Eeuo pipefail
+        "$@"
+    )
+    status=$?
+    set -e
+    if (( status != 0 )); then
+        error "该项操作未完成（退出码：${status}），已返回维护菜单。"
+    fi
+    return 0
+}
+
+confirm() {
+    local prompt="$1" answer
+    read -rp "$prompt [y/N]：" answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || maintenance_die "缺少命令：$1"
+}
+
+backup_file() {
+    local target="$1" label backup_dir
+    [[ "$target" == /* ]] || maintenance_die "备份目标必须使用绝对路径：$target"
+    label="$(basename "$target" | tr -c 'A-Za-z0-9._-' '_')"
+    backup_dir="$(create_backup_dir "maintenance-${label}")"
+    backup_one "$target" "$backup_dir"
+    info "已备份修改前状态：$target -> $backup_dir" >&2
+    printf '%s\n' "$backup_dir"
+}
+
+rollback_path() {
+    local target="$1" backup_dir="$2"
+    restore_one "$target" "$backup_dir"
+}
+
+apt_is_busy() {
+    pgrep -x apt >/dev/null 2>&1 ||
+        pgrep -x apt-get >/dev/null 2>&1 ||
+        pgrep -x dpkg >/dev/null 2>&1 ||
+        pgrep -x unattended-upgrade >/dev/null 2>&1
+}
+
+ensure_apt_available() {
+    if apt_is_busy; then
+        maintenance_die "APT/dpkg 正在运行。脚本不会强杀进程或删除锁文件，请稍后重试。"
+    fi
+}
+
+human_size() {
+    local path="$1" size
+    if [[ -e "$path" ]]; then
+        size="$(du -sh "$path" 2>/dev/null | awk '{print $1}' || true)"
+        printf '%s\n' "${size:-无法读取}"
+    else
+        printf '0\n'
+    fi
+}
+
+ensure_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+    warn "安全合并 JSON 需要 jq，但当前尚未安装。"
+    confirm "现在通过 APT 安装 jq 吗" || return 1
+    ensure_apt_available
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y jq
+}
+
+maintenance_header() {
+    clear 2>/dev/null || true
+    printf '%s\n' '============================================================'
+    printf ' VPS 系统调优与维护 v%s\n' "$SCRIPT_VERSION"
+    printf '%s\n' '============================================================'
+}
+
+root_storage_summary() {
+    local root_source root_device root_fstype virt disk_line rota tran medium
+    root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    root_fstype=$(findmnt -n -o FSTYPE / 2>/dev/null || printf '未知')
+    root_device=$(readlink -f "$root_source" 2>/dev/null || printf '%s' "$root_source")
+    virt=$(systemd-detect-virt 2>/dev/null || true)
+    disk_line=$(lsblk -s -n -r -o NAME,TYPE,ROTA,TRAN "$root_device" 2>/dev/null |
+        awk '$2=="disk" {print; exit}' || true)
+
+    if [[ -n "$disk_line" ]]; then
+        read -r _ _ rota tran <<<"$disk_line"
+        case "${tran:-}:${rota:-}" in
+            nvme:*) medium="NVMe（非旋转存储）" ;;
+            *:1) medium="HDD/旋转盘标志" ;;
+            *:0) medium="SSD或虚拟非旋转盘" ;;
+            *) medium="介质类型未知" ;;
+        esac
+        printf '%s，根设备=%s，文件系统=%s' "$medium" "$root_source" "$root_fstype"
+    else
+        printf '无法从虚拟块设备识别介质，根设备=%s，文件系统=%s' "${root_source:-未知}" "$root_fstype"
+    fi
+
+    if [[ -n "$virt" && "$virt" != "none" ]]; then
+        printf '；虚拟化=%s，宿主真实硬盘类型无法确认' "$virt"
+    fi
+    printf '\n'
+}
+
+system_report() {
+    local bbr="未知" fq="未知" docker_status="未安装" docker_driver="-"
+    bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '不可用')
+    fq=$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '不可用')
+
+    if command -v docker >/dev/null 2>&1; then
+        docker_status=$(docker --version 2>/dev/null || printf '已安装但不可用')
+        docker_driver=$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || printf '无法查询')
+    fi
+
+    printf "操作系统      : %s\n" "$OS_NAME"
+    printf "内核          : %s\n" "$(uname -r)"
+    printf "BBR/FQ        : %s / %s\n" "$bbr" "$fq"
+    printf "时区          : %s\n" "$(timedatectl show -p Timezone --value 2>/dev/null || readlink -f /etc/localtime)"
+    printf "Docker        : %s\n" "$docker_status"
+    printf "Docker日志驱动: %s\n" "$docker_driver"
+    printf "Journal占用   : %s\n" "$(journalctl --disk-usage 2>/dev/null | sed 's/^Archived and active journals take up //' || printf '无法查询')"
+    printf "APT缓存       : %s\n" "$(human_size /var/cache/apt/archives)"
+    printf "根存储        : %s\n" "$(root_storage_summary)"
+    printf "swappiness    : %s\n" "$(sysctl -n vm.swappiness 2>/dev/null || printf '不可用')"
+    printf "\n内存与Swap：\n"
+    free -h || true
+    printf "\nSwap设备：\n"
+    swapon --show || true
+    printf "\n磁盘：\n"
+    df -hT -x tmpfs -x devtmpfs || true
+    if command -v docker >/dev/null 2>&1; then
+        printf "\nDocker占用：\n"
+        docker system df 2>/dev/null || warn "无法读取 Docker 占用。"
+    fi
+}
+
+find_sysctl_conflicts() {
+    local key_pattern='^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*='
+    grep -RnsE "$key_pattern" /etc/sysctl.conf /etc/sysctl.d 2>/dev/null |
+        grep -v "^${NETWORK_CONF}:" || true
+}
+
+configure_bbr() {
+    require_root
+    require_command sysctl
+    local conflicts backup_dir tmp log_tmp
+
+    conflicts=$(find_sysctl_conflicts)
+    if [[ -n "$conflicts" ]]; then
+        warn "发现其他 BBR/队列配置："
+        printf '%s\n' "$conflicts"
+        confirm "继续创建独立全局配置吗？后加载的重复参数可能覆盖前面的值" || return 0
+    fi
+
+    if [[ ! -e /proc/sys/net/ipv4/tcp_congestion_control ]]; then
+        maintenance_die "当前内核不提供 TCP 拥塞控制参数。"
+    fi
+
+    modprobe tcp_bbr 2>/dev/null || true
+    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        maintenance_die "当前内核未提供 BBR，未修改配置。"
+    fi
+
+    backup_dir=$(backup_file "$NETWORK_CONF")
+    install -d -m 0755 /etc/sysctl.d
+    tmp=$(mktemp) || maintenance_die "无法创建BBR临时配置。"
+    if ! log_tmp=$(mktemp); then
+        rm -f -- "$tmp"
+        maintenance_die "无法创建BBR验证日志。"
+    fi
+    printf '%s\n' \
+        '# Managed by vps-init.sh' \
+        'net.core.default_qdisc=fq' \
+        'net.ipv4.tcp_congestion_control=bbr' > "$tmp"
+    install -m 0644 "$tmp" "$NETWORK_CONF"
+    rm -f "$tmp"
+
+    if ! sysctl --system >"$log_tmp" 2>&1; then
+        warn "sysctl 应用失败，输出如下："
+        sed -n '1,160p' "$log_tmp"
+        rollback_path "$NETWORK_CONF" "$backup_dir"
+        sysctl --system >/dev/null 2>&1 || true
+        rm -f -- "$log_tmp"
+        maintenance_die "已回滚 BBR 配置。"
+    fi
+    rm -f -- "$log_tmp"
+
+    if [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr ]] &&
+       [[ $(sysctl -n net.core.default_qdisc) == fq ]]; then
+        ok "BBR+FQ 已全局生效。"
+    else
+        warn "配置已写入，但实际值未达到预期，请检查重复 sysctl 配置。"
+    fi
+}
+
+detect_x86_64_level() {
+    local loader output level
+    for loader in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2; do
+        [[ -x "$loader" ]] || continue
+        output=$($loader --help 2>/dev/null || true)
+        for level in 4 3 2; do
+            if grep -Eq "x86-64-v${level} .*supported" <<<"$output"; then
+                printf '%s\n' "$level"
+                return 0
+            fi
+        done
+    done
+
+    # 无法获得 glibc 的完整 psABI 判断时选择最保守的 v1，避免非法指令。
+    printf '1\n'
+}
+
+xanmod_select_package() {
+    local cpu_level=$1 track=$2
+    local effective_level=$cpu_level
+    local candidates=()
+
+    (( effective_level > 3 )) && effective_level=3
+    if [[ "$track" == "lts" ]]; then
+        candidates=("linux-xanmod-lts-x64v${effective_level}")
+    else
+        candidates=("linux-xanmod-x64v${effective_level}" "linux-xanmod-lts-x64v${effective_level}")
+    fi
+
+    # XanMod mainline 可能不提供 x64v1；v1 始终尝试 LTS。
+    if (( effective_level == 1 )); then
+        candidates=("linux-xanmod-lts-x64v1")
+    fi
+
+    local package
+    for package in "${candidates[@]}"; do
+        if apt-cache show "$package" >/dev/null 2>&1; then
+            printf '%s\n' "$package"
+            return 0
+        fi
+    done
+    return 1
+}
+
+xanmod_environment_check() {
+    local arch virt boot_avail_kb
+    arch=$(uname -m)
+    [[ "$arch" == "x86_64" ]] || maintenance_die "XanMod官方仓库目前只提供x86_64构建；当前架构：$arch"
+
+    virt=$(systemd-detect-virt 2>/dev/null || true)
+    case "$virt" in
+        openvz|lxc|lxc-libvirt|docker|podman|systemd-nspawn|wsl)
+            maintenance_die "当前虚拟化类型为 $virt，通常不能自行更换宿主内核。"
+            ;;
+    esac
+
+    boot_avail_kb=$(df -Pk /boot 2>/dev/null | awk 'NR==2 {print $4}')
+    if [[ "$boot_avail_kb" =~ ^[0-9]+$ ]] && (( boot_avail_kb < 600000 )); then
+        warn "/boot 可用空间不足约600MB：$((boot_avail_kb / 1024))MB。安装前请确认旧内核数量。"
+        confirm "仍要继续吗" || return 1
+    fi
+
+    printf "虚拟化类型：%s\n" "${virt:-物理机或未识别}"
+    printf "当前内核：%s\n" "$(uname -r)"
+    warn "更换内核存在无法启动风险，请确认VPS控制台/VNC可用，并提前建立快照。"
+}
+
+install_xanmod_bbr3() {
+    require_root
+    load_supported_os
+    xanmod_environment_check || return 0
+    ensure_apt_available
+
+    local cpu_level track package key_tmp repo_backup key_backup
+    cpu_level=$(detect_x86_64_level)
+    printf "检测到CPU最高psABI等级：x86-64-v%s\n" "$cpu_level"
+    if (( cpu_level == 4 )); then
+        info "XanMod当前使用x64v3包覆盖v4级CPU，BBRv3功能不受影响。"
+    fi
+
+    printf "1. LTS内核（推荐用于长期运行的VPS）\n"
+    printf "2. Main稳定内核（版本更新）\n"
+    read -r -p "请选择 [1]: " track
+    case "${track:-1}" in
+        1) track="lts" ;;
+        2) track="main" ;;
+        *) maintenance_die "无效选择。" ;;
+    esac
+
+    confirm "从XanMod官方仓库安装内核并保留现有内核" || return 0
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
+
+    install -d -m 0755 /etc/apt/keyrings /etc/apt/sources.list.d
+    key_backup=$(backup_file "$XANMOD_KEYRING")
+    repo_backup=$(backup_file "$XANMOD_REPO_CONF")
+    key_tmp=$(mktemp)
+    if ! curl --proto '=https' --tlsv1.2 -fsSL https://dl.xanmod.org/archive.key -o "$key_tmp"; then
+        rm -f "$key_tmp"
+        maintenance_die "无法从XanMod官方下载仓库密钥，未修改软件源。"
+    fi
+    if ! gpg --batch --yes --dearmor --output "$XANMOD_KEYRING" "$key_tmp"; then
+        rm -f "$key_tmp"
+        rollback_path "$XANMOD_KEYRING" "$key_backup"
+        maintenance_die "XanMod密钥转换失败。"
+    fi
+    rm -f "$key_tmp"
+    chmod 0644 "$XANMOD_KEYRING"
+
+    local repo_tmp
+    repo_tmp=$(mktemp)
+    printf 'deb [signed-by=%s] https://deb.xanmod.org %s main\n' \
+        "$XANMOD_KEYRING" "$OS_CODENAME" > "$repo_tmp"
+    install -m 0644 "$repo_tmp" "$XANMOD_REPO_CONF"
+    rm -f "$repo_tmp"
+
+    if ! apt-get update; then
+        rollback_path "$XANMOD_REPO_CONF" "$repo_backup"
+        rollback_path "$XANMOD_KEYRING" "$key_backup"
+        maintenance_die "XanMod软件源更新失败，已恢复原配置。"
+    fi
+
+    if ! package=$(xanmod_select_package "$cpu_level" "$track"); then
+        warn "当前系统代号为：$OS_CODENAME；仓库中没有匹配的XanMod包。"
+        apt-cache search '^linux-xanmod' | sed -n '1,40p' || true
+        rollback_path "$XANMOD_REPO_CONF" "$repo_backup"
+        rollback_path "$XANMOD_KEYRING" "$key_backup"
+        maintenance_die "未安装任何内核，已恢复软件源配置。"
+    fi
+
+    printf "将安装：%s\n" "$package"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"; then
+        warn "内核安装未完成；为便于检查和重试，已配置的XanMod官方软件源予以保留。"
+        maintenance_die "请检查上方APT错误。在修复dpkg/APT状态前不要重启。"
+    fi
+    dpkg-query -W -f='${db:Status-Status}\n' "$package" 2>/dev/null | grep -q '^installed$' ||
+        maintenance_die "XanMod元包安装验证失败，请检查APT输出。"
+    command -v update-grub >/dev/null 2>&1 && update-grub
+
+    ok "XanMod内核包已安装，现有发行版内核保持不动。"
+    printf "当前运行内核：%s\n" "$(uname -r)"
+    printf "已安装元包：%s\n" "$package"
+    warn "必须重启后才会运行XanMod/BBRv3；脚本不会自动重启。"
+    modprobe tcp_bbr 2>/dev/null || true
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        if confirm "同时写入BBR+FQ全局配置吗？重启XanMod后将使用BBRv3"; then
+            configure_bbr
+        fi
+    else
+        warn "当前旧内核不提供BBR，因此暂不写入sysctl配置。重启进入XanMod后，再运行BBR菜单的选项1。"
+    fi
+}
+
+show_bbr_status() {
+    local kernel cc qdisc
+    kernel=$(uname -r)
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '不可用')
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '不可用')
+    printf "当前内核：%s\n" "$kernel"
+    printf "拥塞控制：%s\n" "$cc"
+    printf "队列算法：%s\n" "$qdisc"
+    printf "已安装XanMod包：\n"
+    dpkg-query -W -f='${db:Status-Status} ${binary:Package} ${Version}\n' 'linux-*xanmod*' 2>/dev/null |
+        awk '$1=="installed" {print "  " $2 " " $3}' || true
+    if [[ "$kernel" == *xanmod* && "$cc" == "bbr" ]]; then
+        ok "正在运行XanMod内核的内置BBR（XanMod当前集成Google BBRv3）。"
+    elif [[ "$cc" == "bbr" ]]; then
+        warn "BBR已启用，但当前内核不是XanMod，通常不能据此认定为BBRv3。"
+    else
+        warn "当前没有启用BBR。"
+    fi
+}
+
+bbr_menu() {
+    while true; do
+        maintenance_header
+        printf "1. 启用当前内核自带的 BBR+FQ\n"
+        printf "2. 安装/更新 XanMod 内核 + BBRv3\n"
+        printf "3. 查看 BBR/XanMod 状态\n"
+        printf "0. 返回\n"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) maintenance_run configure_bbr; pause_screen ;;
+            2) maintenance_run install_xanmod_bbr3; pause_screen ;;
+            3) maintenance_run show_bbr_status; pause_screen ;;
+            0) return 0 ;;
+            *) warn "无效选择。"; sleep 1 ;;
+        esac
+    done
+}
+
+configure_zram() {
+    require_root
+    ensure_apt_available
+    local total_mb default_percent percent current_swap backup_dir
+    total_mb=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
+    default_percent=50
+    current_swap=$(swapon --show --noheadings 2>/dev/null || true)
+
+    printf "物理内存：%s MB\n" "$total_mb"
+    printf "当前 swappiness：%s\n" "$(sysctl -n vm.swappiness)"
+    printf "当前 Swap：\n%s\n" "${current_swap:-无}"
+    info "建议保留磁盘 Swap 作为低优先级兜底，zRAM 使用高优先级。"
+    read -r -p "zRAM 占物理内存比例 [${default_percent}%]: " percent
+    percent=${percent:-$default_percent}
+    if [[ ! "$percent" =~ ^[0-9]+$ ]] || (( percent < 10 || percent > 100 )); then
+        maintenance_die "比例必须是 10-100 的整数。"
+    fi
+
+    confirm "安装/更新 zram-tools 并配置 zRAM=${percent}%、优先级=100" || return 0
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y zram-tools
+
+    backup_dir=$(backup_file "$ZRAM_CONF")
+    local tmp
+    tmp=$(mktemp)
+    printf '%s\n' \
+        '# Managed by vps-init.sh' \
+        'ALGO=lz4' \
+        "PERCENT=${percent}" \
+        'PRIORITY=100' > "$tmp"
+    install -m 0644 "$tmp" "$ZRAM_CONF"
+    rm -f "$tmp"
+
+    if ! systemctl restart zramswap; then
+        rollback_path "$ZRAM_CONF" "$backup_dir"
+        systemctl restart zramswap 2>/dev/null || true
+        maintenance_die "zRAM 启动失败，已恢复原配置。"
+    fi
+
+    zramctl || true
+    swapon --show || true
+    ok "zRAM 已配置；磁盘 Swap 未被删除。"
+    warn "脚本没有自动修改 vm.swappiness。可观察后再决定是否从当前值调整到 40 或 60。"
+}
+
+find_swappiness_conflicts() {
+    grep -RnsE '^[[:space:]]*vm\.swappiness[[:space:]]*=' \
+        /etc/sysctl.conf /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d \
+        2>/dev/null | grep -v "^${MEMORY_CONF}:" || true
+}
+
+configure_swappiness() {
+    require_root
+    require_command sysctl
+    local current value conflicts backup_dir tmp log_tmp actual
+    current=$(sysctl -n vm.swappiness)
+    conflicts=$(find_swappiness_conflicts)
+
+    printf "当前 vm.swappiness：%s\n" "$current"
+    printf "  10  = 保守使用Swap，适合同时有磁盘Swap的通用VPS\n"
+    printf "  60  = Linux常见默认值，较均衡\n"
+    printf "  100 = 更积极使用zRAM；zRAM耗尽后仍可能使用低优先级磁盘Swap\n"
+    printf "  0-200均为内核允许范围，具体效果取决于负载\n"
+    if [[ -n "$conflicts" ]]; then
+        warn "发现其他持久化 swappiness 配置："
+        printf '%s\n' "$conflicts"
+        warn "脚本不会修改这些文件；如果它们加载更晚，新值可能被覆盖并触发自动回滚。"
+    fi
+
+    read -r -p "新的 vm.swappiness [${current}]: " value
+    value=${value:-$current}
+    if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 0 || value > 200 )); then
+        maintenance_die "vm.swappiness必须是0-200之间的整数。"
+    fi
+    confirm "将 vm.swappiness 设置为 ${value} 并立即应用" || return 0
+
+    backup_dir=$(backup_file "$MEMORY_CONF")
+    tmp=$(mktemp) || maintenance_die "无法创建swappiness临时配置。"
+    if ! log_tmp=$(mktemp); then
+        rm -f -- "$tmp"
+        maintenance_die "无法创建swappiness验证日志。"
+    fi
+    printf '%s\n' \
+        '# Managed by vps-init.sh' \
+        '# Global setting shared by zRAM and disk Swap' \
+        "vm.swappiness=${value}" > "$tmp"
+    install -d -m 0755 /etc/sysctl.d
+    if ! install -m 0644 "$tmp" "$MEMORY_CONF"; then
+        rm -f -- "$tmp" "$log_tmp"
+        rollback_path "$MEMORY_CONF" "$backup_dir"
+        maintenance_die "swappiness配置写入失败，已回滚。"
+    fi
+    rm -f -- "$tmp"
+
+    if ! sysctl --system >"$log_tmp" 2>&1; then
+        warn "sysctl应用失败，输出如下："
+        sed -n '1,120p' "$log_tmp"
+        rollback_path "$MEMORY_CONF" "$backup_dir"
+        sysctl --system >/dev/null 2>&1 || sysctl -w "vm.swappiness=$current" >/dev/null
+        rm -f -- "$log_tmp"
+        maintenance_die "已恢复原swappiness配置。"
+    fi
+    actual=$(sysctl -n vm.swappiness)
+    if [[ "$actual" != "$value" ]]; then
+        warn "实际值为 ${actual}，目标值为 ${value}；存在加载顺序更晚的重复配置。"
+        [[ -n "$conflicts" ]] && printf '%s\n' "$conflicts"
+        rollback_path "$MEMORY_CONF" "$backup_dir"
+        sysctl --system >/dev/null 2>&1 || sysctl -w "vm.swappiness=$current" >/dev/null
+        rm -f -- "$log_tmp"
+        maintenance_die "未保留无效配置，已回滚。"
+    fi
+    rm -f -- "$log_tmp"
+    ok "vm.swappiness=${actual} 已立即生效并持久化。"
+    info "它控制系统整体使用Swap的倾向；zRAM和磁盘Swap之间仍由各自PRIO决定顺序。"
+}
+
+create_disk_swap() {
+    require_root
+    require_command findmnt
+    require_command lsblk
+    require_command dd
+    require_command mkswap
+    require_command swapon
+
+    local root_fstype total_mb default_mb size_mb free_mb required_mb backup_dir tmp
+    root_fstype=$(findmnt -n -o FSTYPE / 2>/dev/null || true)
+    printf "根存储检测：%s\n" "$(root_storage_summary)"
+
+    case "$root_fstype" in
+        ext2|ext3|ext4|xfs) ;;
+        btrfs)
+            maintenance_die "Btrfs交换文件需要NOCOW等专门处理，本脚本为避免创建不可用Swap而拒绝自动操作。"
+            ;;
+        *)
+            maintenance_die "当前根文件系统为 ${root_fstype:-未知}，不在安全支持范围（ext2/3/4、XFS）。"
+            ;;
+    esac
+
+    if swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$DISK_SWAP_FILE"; then
+        ok "$DISK_SWAP_FILE 已经作为磁盘Swap启用。"
+        swapon --show
+        return 0
+    fi
+    [[ ! -e "$DISK_SWAP_FILE" && ! -L "$DISK_SWAP_FILE" ]] ||
+        maintenance_die "$DISK_SWAP_FILE 已存在但未启用。为避免覆盖未知文件，脚本不会处理它。"
+    if awk -v path="$DISK_SWAP_FILE" '$1==path && $3=="swap" {found=1} END{exit !found}' "$FSTAB_FILE"; then
+        maintenance_die "$FSTAB_FILE 已存在 $DISK_SWAP_FILE 条目，但文件当前不存在。请先人工检查。"
+    fi
+
+    total_mb=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
+    if (( total_mb <= 2048 )); then
+        default_mb=1024
+    else
+        default_mb=2048
+    fi
+    free_mb=$(df -Pm / | awk 'NR==2 {print $4}')
+    printf "物理内存：%s MB；根分区可用：%s MB\n" "$total_mb" "$free_mb"
+    info "磁盘Swap优先级设为10，低于zRAM的100；只有内存和zRAM压力较大时才会使用。"
+    read -r -p "磁盘Swap大小（MB）[${default_mb}]: " size_mb
+    size_mb=${size_mb:-$default_mb}
+    if [[ ! "$size_mb" =~ ^[0-9]+$ ]] || (( size_mb < 256 || size_mb > 16384 )); then
+        maintenance_die "大小必须是256-16384之间的整数（MB）。"
+    fi
+    required_mb=$((size_mb + 512))
+    (( free_mb >= required_mb )) ||
+        maintenance_die "磁盘空间不足：创建后还需至少保留512MB，当前需要 ${required_mb}MB。"
+
+    warn "HDD上的Swap明显慢于SSD/NVMe，但低优先级应急兜底仍可防止部分OOM。"
+    confirm "使用dd创建 ${DISK_SWAP_FILE}（${size_mb}MB）并写入fstab" || return 0
+
+    backup_dir=$(backup_file "$FSTAB_FILE")
+    if ! (umask 077; dd if=/dev/zero of="$DISK_SWAP_FILE" bs=1M count="$size_mb" status=progress conv=fsync); then
+        rm -f -- "$DISK_SWAP_FILE"
+        maintenance_die "Swap文件创建失败；未修改fstab。"
+    fi
+    chmod 0600 "$DISK_SWAP_FILE"
+    if ! mkswap -L vps-init-swap "$DISK_SWAP_FILE"; then
+        rm -f -- "$DISK_SWAP_FILE"
+        maintenance_die "mkswap失败；已删除本次创建的文件，未修改fstab。"
+    fi
+
+    if ! tmp=$(mktemp); then
+        rm -f -- "$DISK_SWAP_FILE"
+        maintenance_die "无法创建fstab临时文件；已删除本次Swap文件。"
+    fi
+    if ! cp -a -- "$FSTAB_FILE" "$tmp"; then
+        rm -f -- "$tmp" "$DISK_SWAP_FILE"
+        maintenance_die "无法读取fstab；已删除本次Swap文件。"
+    fi
+    printf '%s\n' "$DISK_SWAP_FILE none swap sw,pri=10,nofail 0 0" >> "$tmp"
+    if ! findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
+        rm -f -- "$tmp" "$DISK_SWAP_FILE"
+        maintenance_die "新fstab验证失败；已删除本次Swap文件，原fstab未修改。"
+    fi
+    if ! install -m 0644 "$tmp" "$FSTAB_FILE"; then
+        rm -f -- "$tmp" "$DISK_SWAP_FILE"
+        rollback_path "$FSTAB_FILE" "$backup_dir"
+        maintenance_die "fstab写入失败，已回滚。"
+    fi
+    rm -f -- "$tmp"
+
+    if ! swapon --priority 10 "$DISK_SWAP_FILE"; then
+        rollback_path "$FSTAB_FILE" "$backup_dir"
+        rm -f -- "$DISK_SWAP_FILE"
+        maintenance_die "Swap启用失败；已恢复fstab并删除本次创建的文件。"
+    fi
+
+    ok "磁盘Swap已创建并立即生效。"
+    swapon --show
+    warn "脚本没有修改swappiness，也没有停用zRAM。"
+}
+
+swap_menu() {
+    while true; do
+        maintenance_header
+        printf "1. 查看内存、Swap与根存储类型\n"
+        printf "2. 配置 zRAM（优先级100）\n"
+        printf "3. 创建磁盘 Swap 文件（优先级10）\n"
+        printf "4. 设置 vm.swappiness（全局Swap倾向）\n"
+        printf "0. 返回\n"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1)
+                free -h
+                printf "\nvm.swappiness：%s\n" "$(sysctl -n vm.swappiness 2>/dev/null || printf '不可用')"
+                printf "\nSwap设备：\n"
+                swapon --show || true
+                printf "\n根存储：%s\n" "$(root_storage_summary)"
+                pause_screen
+                ;;
+            2) maintenance_run configure_zram; pause_screen ;;
+            3) maintenance_run create_disk_swap; pause_screen ;;
+            4) maintenance_run configure_swappiness; pause_screen ;;
+            0) return 0 ;;
+            *) warn "无效选择。"; sleep 1 ;;
+        esac
+    done
+}
+
+docker_repo_setup() {
+    ensure_apt_available
+    local repo_os=$OS_ID keyring source_file arch key_backup source_backup key_tmp tmp
+    arch=$(dpkg --print-architecture)
+    [[ -n "$OS_CODENAME" ]] || maintenance_die "无法识别系统代号。"
+
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
+    install -m 0755 -d /etc/apt/keyrings
+    keyring="/etc/apt/keyrings/docker.asc"
+    source_file="/etc/apt/sources.list.d/docker.sources"
+    key_backup=$(backup_file "$keyring")
+    source_backup=$(backup_file "$source_file")
+
+    key_tmp=$(mktemp)
+    if ! curl --proto '=https' --tlsv1.2 -fsSL "https://download.docker.com/linux/${repo_os}/gpg" -o "$key_tmp" ||
+       ! gpg --batch --show-keys "$key_tmp" >/dev/null 2>&1; then
+        rm -f -- "$key_tmp"
+        maintenance_die "Docker 官方仓库密钥下载或验证失败，未修改软件源。"
+    fi
+    if ! install -m 0644 "$key_tmp" "$keyring"; then
+        rm -f -- "$key_tmp"
+        rollback_path "$keyring" "$key_backup"
+        maintenance_die "Docker 仓库密钥写入失败，已恢复原密钥。"
+    fi
+    rm -f -- "$key_tmp"
+
+    tmp=$(mktemp)
+    printf '%s\n' \
+        'Types: deb' \
+        "URIs: https://download.docker.com/linux/${repo_os}" \
+        "Suites: ${OS_CODENAME}" \
+        'Components: stable' \
+        "Architectures: ${arch}" \
+        "Signed-By: ${keyring}" > "$tmp"
+    if ! install -m 0644 "$tmp" "$source_file"; then
+        rm -f -- "$tmp"
+        rollback_path "$keyring" "$key_backup"
+        rollback_path "$source_file" "$source_backup"
+        maintenance_die "Docker 软件源配置写入失败，已恢复原配置。"
+    fi
+    rm -f "$tmp"
+
+    if ! apt-get update; then
+        rollback_path "$source_file" "$source_backup"
+        rollback_path "$keyring" "$key_backup"
+        apt-get update >/dev/null 2>&1 || true
+        maintenance_die "Docker 软件源不可用，已恢复原配置。"
+    fi
+}
+
+install_or_update_docker() {
+    require_root
+    if command -v docker >/dev/null 2>&1; then
+        docker --version || true
+        docker compose version 2>/dev/null || true
+        apt-cache policy docker-ce docker-compose-plugin | sed -n '1,100p'
+        confirm "通过 Docker 官方 APT 仓库更新现有 Docker/Compose" || return 0
+    else
+        confirm "配置 Docker 官方 APT 仓库并安装 Docker/Compose" || return 0
+    fi
+
+    docker_repo_setup
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable --now docker
+    docker --version
+    docker compose version
+    ok "Docker/Compose 安装或更新完成。"
+}
+
+uninstall_docker_keep_data() {
+    require_root
+    command -v docker >/dev/null 2>&1 || { warn "Docker 未安装。"; return 0; }
+    docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
+    printf "Docker数据目录：%s\n" "$(human_size /var/lib/docker)"
+    warn "本操作仅卸载程序包，明确保留 /var/lib/docker 和 /var/lib/containerd。"
+    confirm "确定停止 Docker 并卸载程序包吗" || return 0
+    ensure_apt_available
+    systemctl stop docker 2>/dev/null || true
+    apt-get purge docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    ok "Docker程序包已卸载，Docker数据目录仍保留。"
+}
+
+merge_docker_logging() {
+    require_root
+    require_command docker
+    require_command dockerd
+    local max_size max_file current_driver backup_dir tmp
+    max_size="20m"
+    max_file="3"
+    read -r -p "单个日志文件上限 [20m]: " max_size
+    max_size=${max_size:-20m}
+    read -r -p "最多保留文件数 [3]: " max_file
+    max_file=${max_file:-3}
+    [[ "$max_size" =~ ^[1-9][0-9]*[kKmMgG]$ ]] || maintenance_die "日志大小格式示例：20m、100m、1g。"
+    [[ "$max_file" =~ ^[1-9][0-9]*$ ]] || maintenance_die "保留数量必须为正整数。"
+
+    if systemctl cat docker 2>/dev/null | grep -Eq -- '--log-driver|--log-opt' ||
+       pgrep -a -x dockerd 2>/dev/null | grep -Eq -- '--log-driver|--log-opt'; then
+        maintenance_die "dockerd 启动参数已包含 --log-driver/--log-opt，请先消除重复配置。"
+    fi
+
+    if [[ -s "$DOCKER_CONF" ]]; then
+        ensure_jq || maintenance_die "没有 jq，未修改 Docker 配置。"
+        jq empty "$DOCKER_CONF" || maintenance_die "$DOCKER_CONF 当前不是合法 JSON。"
+        current_driver=$(jq -r '."log-driver" // "json-file"' "$DOCKER_CONF")
+    else
+        ensure_jq || maintenance_die "没有 jq，未修改 Docker 配置。"
+        current_driver="json-file"
+    fi
+
+    if [[ "$current_driver" != "json-file" ]]; then
+        warn "当前全局日志驱动是：$current_driver"
+        confirm "确定改为 json-file 吗" || return 0
+    fi
+
+    printf "将设置：json-file，max-size=%s，max-file=%s，compress=true\n" "$max_size" "$max_file"
+    confirm "合并到 Docker 全局配置" || return 0
+
+    install -d -m 0755 /etc/docker
+    backup_dir=$(backup_file "$DOCKER_CONF")
+    tmp=$(mktemp)
+    if [[ -s "$DOCKER_CONF" ]]; then
+        jq --arg size "$max_size" --arg files "$max_file" '
+          . + {
+            "log-driver": "json-file",
+            "log-opts": ((."log-opts" // {}) + {
+              "max-size": $size,
+              "max-file": $files,
+              "compress": "true"
+            })
+          }
+        ' "$DOCKER_CONF" > "$tmp"
+    else
+        jq -n --arg size "$max_size" --arg files "$max_file" '{
+          "log-driver": "json-file",
+          "log-opts": {
+            "max-size": $size,
+            "max-file": $files,
+            "compress": "true"
+          }
+        }' > "$tmp"
+    fi
+
+    if ! dockerd --validate --config-file="$tmp"; then
+        rm -f "$tmp"
+        maintenance_die "Docker配置验证失败，原配置没有变化。"
+    fi
+    install -m 0644 "$tmp" "$DOCKER_CONF"
+    rm -f "$tmp"
+
+    ok "Docker全局日志配置已安全合并并通过验证。"
+    warn "现有容器不会改变；只对新建或通过原 Compose/1Panel 重建的容器生效。"
+    if confirm "现在重启 Docker 服务吗？现有容器可能短暂中断"; then
+        if ! systemctl restart docker; then
+            rollback_path "$DOCKER_CONF" "$backup_dir"
+            systemctl restart docker 2>/dev/null || true
+            maintenance_die "Docker重启失败，已恢复原配置。"
+        fi
+        ok "Docker已重启。请在1Panel中逐个重建容器。"
+    fi
+}
+
+show_container_log_configs() {
+    command -v docker >/dev/null 2>&1 || { warn "Docker 未安装。"; return 0; }
+    printf "%-30s %-12s %s\n" "容器" "驱动" "选项"
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        docker inspect --format '{{.Name}}|{{.HostConfig.LogConfig.Type}}|{{json .HostConfig.LogConfig.Config}}' "$id" |
+            sed 's#^/##' | awk -F'|' '{printf "%-30s %-12s %s\n",$1,$2,$3}'
+    done < <(docker ps -aq)
+}
+
+configure_journal_limits() {
+    require_root
+    local max_use retention keep_free backup_dir tmp
+    read -r -p "Journal最大占用 [500M]: " max_use
+    max_use=${max_use:-500M}
+    read -r -p "最长保留时间 [30day]: " retention
+    retention=${retention:-30day}
+    read -r -p "至少为系统保留磁盘空间 [1G]: " keep_free
+    keep_free=${keep_free:-1G}
+    confirm "写入 journald 容量和保留期限配置（不会立即清空日志）" || return 0
+
+    backup_dir=$(backup_file "$JOURNAL_CONF")
+    install -d -m 0755 /etc/systemd/journald.conf.d
+    tmp=$(mktemp)
+    printf '%s\n' \
+        '# Managed by vps-init.sh' \
+        '[Journal]' \
+        "SystemMaxUse=${max_use}" \
+        "SystemKeepFree=${keep_free}" \
+        "MaxRetentionSec=${retention}" > "$tmp"
+    install -m 0644 "$tmp" "$JOURNAL_CONF"
+    rm -f "$tmp"
+
+    if ! systemd-analyze cat-config systemd/journald.conf >/dev/null 2>&1; then
+        rollback_path "$JOURNAL_CONF" "$backup_dir"
+        maintenance_die "journald 配置检查失败，已回滚。"
+    fi
+    if ! systemctl restart systemd-journald; then
+        rollback_path "$JOURNAL_CONF" "$backup_dir"
+        systemctl restart systemd-journald 2>/dev/null || true
+        maintenance_die "journald 重启失败，已恢复原配置。"
+    fi
+    ok "journald 限制已配置；没有执行 vacuum-time=1s。"
+}
+
+set_timezone() {
+    require_root
+    local current
+    current=$(timedatectl show -p Timezone --value)
+    printf "当前时区：%s\n" "$current"
+    [[ "$current" == "Asia/Shanghai" ]] && { ok "已经是 Asia/Shanghai。"; return 0; }
+    confirm "设置为 Asia/Shanghai" || return 0
+    timedatectl set-timezone Asia/Shanghai
+    ok "时区已设置为 $(timedatectl show -p Timezone --value)。"
+}
+
+safe_cleanup() {
+    require_root
+    printf "APT缓存：%s\n" "$(human_size /var/cache/apt/archives)"
+    journalctl --disk-usage 2>/dev/null || true
+    if command -v docker >/dev/null 2>&1; then
+        docker system df || true
+    fi
+
+    if confirm "清理APT已下载的 .deb 缓存吗"; then
+        ensure_apt_available
+        apt-get clean
+        ok "APT缓存已清理。"
+    fi
+
+    info "以下仅模拟 apt autoremove，不会删除："
+    apt-get -s autoremove 2>/dev/null | sed -n '1,160p' || true
+    if confirm "确认根据上面列表执行 apt autoremove --purge 吗"; then
+        ensure_apt_available
+        apt-get autoremove --purge
+    fi
+
+    if command -v docker >/dev/null 2>&1 && confirm "清理Docker悬空镜像吗？不会使用 -a，也不会清理volume"; then
+        docker image prune
+    fi
+    ok "安全清理流程结束。系统日志、Docker日志、/tmp 和 Docker volume 均未被直接删除。"
+}
+
+monitor_report() {
+    printf "===== vps-init monitor %s =====\n" "$(date --iso-8601=seconds)"
+    df -hT -x tmpfs -x devtmpfs
+    journalctl --disk-usage 2>/dev/null || true
+    printf "APT cache: %s\n" "$(human_size /var/cache/apt/archives)"
+    if command -v docker >/dev/null 2>&1; then
+        docker system df 2>/dev/null || true
+        printf "Large Docker json logs (>200M):\n"
+        find /var/lib/docker/containers -type f -name '*-json.log' -size +200M \
+            -printf '%s %p\n' 2>/dev/null | sort -nr || true
+    fi
+}
+
+install_monitor_timer() {
+    require_root
+    local service=/etc/systemd/system/vps-init-monitor.service
+    local timer=/etc/systemd/system/vps-init-monitor.timer
+    confirm "安装每周一06:06只读磁盘监控任务吗？它不会自动删除任何文件" || return 0
+    [[ -f "$SCRIPT_PATH" ]] || maintenance_die "定时任务需要从已下载的脚本文件安装，不能通过进程替换方式运行。"
+    if [[ "$SCRIPT_PATH" != /usr/local/sbin/vps-init ]]; then
+        backup_file /usr/local/sbin/vps-init >/dev/null
+        install -m 0755 "$SCRIPT_PATH" /usr/local/sbin/vps-init
+    fi
+    backup_file "$service" >/dev/null
+    backup_file "$timer" >/dev/null
+    local tmp
+    tmp=$(mktemp)
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=vps-init read-only disk monitor' \
+        '' \
+        '[Service]' \
+        'Type=oneshot' \
+        "ExecStart=/bin/bash -c '/usr/local/sbin/vps-init --monitor >> ${MONITOR_LOG} 2>&1'" > "$tmp"
+    install -m 0644 "$tmp" "$service"
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=Run vps-init disk monitor weekly' \
+        '' \
+        '[Timer]' \
+        'OnCalendar=Mon *-*-* 06:06:00' \
+        'Persistent=true' \
+        'RandomizedDelaySec=5m' \
+        '' \
+        '[Install]' \
+        'WantedBy=timers.target' > "$tmp"
+    install -m 0644 "$tmp" "$timer"
+    rm -f "$tmp"
+    systemctl daemon-reload
+    systemctl enable --now vps-init-monitor.timer
+    systemctl list-timers vps-init-monitor.timer --no-pager
+    ok "只读监控任务已安装，报告保存至 $MONITOR_LOG。"
+}
+
+docker_menu() {
+    while true; do
+        maintenance_header
+        printf "1. 安装/更新 Docker 与 Compose\n"
+        printf "2. 配置 Docker 全局日志轮转\n"
+        printf "3. 查看现有容器日志配置\n"
+        printf "4. 卸载 Docker 程序（保留全部数据）\n"
+        printf "0. 返回\n"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) maintenance_run install_or_update_docker; pause_screen ;;
+            2) maintenance_run merge_docker_logging; pause_screen ;;
+            3) maintenance_run show_container_log_configs; pause_screen ;;
+            4) maintenance_run uninstall_docker_keep_data; pause_screen ;;
+            0) return 0 ;;
+            *) warn "无效选择。"; sleep 1 ;;
+        esac
+    done
+}
+
+maintenance_menu() {
+    local choice
+    while true; do
+        maintenance_header
+        printf '系统：%s\n\n' "$OS_NAME"
+        printf '[1] 系统现状体检（只读）\n'
+        printf '[2] BBR 管理（系统 BBR / XanMod + BBRv3）\n'
+        printf '[3] 内存与 Swap 管理（zRAM / 磁盘 Swap）\n'
+        printf '[4] Docker 与 Compose 管理\n'
+        printf '[5] 配置 journald 容量与保留期限\n'
+        printf '[6] 设置 Asia/Shanghai 时区\n'
+        printf '[7] 安全清理（逐项预览确认）\n'
+        printf '[8] 安装每周只读磁盘监控\n'
+        printf '[0] 返回主菜单\n'
+        read -rp '请选择：' choice || return 0
+        case "$choice" in
+            1) maintenance_run system_report; pause_screen ;;
+            2) bbr_menu ;;
+            3) swap_menu ;;
+            4) docker_menu ;;
+            5) maintenance_run configure_journal_limits; pause_screen ;;
+            6) maintenance_run set_timezone; pause_screen ;;
+            7) maintenance_run safe_cleanup; pause_screen ;;
+            8) maintenance_run install_monitor_timer; pause_screen ;;
+            0) return 0 ;;
+            *) warn "无效选择。"; pause_screen ;;
+        esac
+    done
 }
 
 hardening_menu() {
@@ -1200,32 +2154,63 @@ main_menu() {
     while true; do
         clear 2>/dev/null || true
         printf '==================================================\n'
-        printf '          VPS SSH 安全初始化工具 v%s\n' "$SCRIPT_VERSION"
+        printf '          VPS 安全初始化与维护工具 v%s\n' "$SCRIPT_VERSION"
         printf '==================================================\n'
         printf '当前用户：root\n'
         printf 'SSH 端口：%s\n\n' "$(ports_csv)"
         printf '[1] 密钥登录与账号加固      [%s]\n' "$(hardening_summary)"
         printf '[2] SSH 固定随机端口        [%s]\n' "$(state_get PORT_STAGE 2>/dev/null || printf 未开始)"
         printf '[3] Fail2ban 防爆破         [%s]\n' "$(fail2ban_summary)"
+        printf '[4] 系统调优与维护          [按需使用]\n'
         printf '[0] 退出\n'
         printf '==================================================\n'
-        printf '推荐顺序：1 → 测试密钥 → 2 → 测试新端口 → 3\n'
+        printf '安全开荒推荐顺序：1 → 测试密钥 → 2 → 测试新端口 → 3；系统维护按需进入 4\n'
         read -rp '请选择：' choice || return 0
         case "$choice" in
             1) hardening_menu ;;
             2) port_menu ;;
             3) fail2ban_menu ;;
+            4) maintenance_menu ;;
             0) return 0 ;;
             *) warn "无效选择。"; pause_screen ;;
         esac
     done
 }
 
+usage() {
+    cat <<EOF
+VPS 安全初始化与维护工具 ${SCRIPT_VERSION}
+
+仅支持 Debian 和 Ubuntu，不适配 PVE。
+
+用法：
+  sudo bash vps-init.sh            打开交互菜单
+  sudo bash vps-init.sh --monitor  输出只读磁盘报告
+  bash vps-init.sh --help          显示帮助
+EOF
+}
+
 main() {
-    require_root
-    initialize_runtime
-    find_sshd
-    main_menu
+    case "${1:-}" in
+        --help|-h)
+            usage
+            ;;
+        --monitor)
+            load_supported_os
+            monitor_report
+            ;;
+        "")
+            require_root
+            load_supported_os
+            initialize_runtime
+            find_sshd
+            main_menu
+            ;;
+        *)
+            usage
+            return 2
+            ;;
+    esac
 }
 
 main "$@"
