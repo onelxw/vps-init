@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
 BACKUP_ROOT="/var/backups/vps-init"
@@ -600,6 +600,7 @@ write_fail2ban_config() {
 enabled = true
 port = ${port_list}
 filter = sshd
+backend = systemd
 
 findtime = 10m
 maxretry = 5
