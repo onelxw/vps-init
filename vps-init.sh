@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.0.2"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
@@ -2046,36 +2046,6 @@ docker_menu() {
     done
 }
 
-maintenance_menu() {
-    local choice
-    while true; do
-        maintenance_header
-        printf '系统：%s\n\n' "$OS_NAME"
-        printf '[1] 系统现状体检（只读）\n'
-        printf '[2] BBR 管理（系统 BBR / XanMod + BBRv3）\n'
-        printf '[3] 内存与 Swap 管理（zRAM / 磁盘 Swap）\n'
-        printf '[4] Docker 与 Compose 管理\n'
-        printf '[5] 配置 journald 容量与保留期限\n'
-        printf '[6] 设置 Asia/Shanghai 时区\n'
-        printf '[7] 安全清理（逐项预览确认）\n'
-        printf '[8] 安装每周只读磁盘监控\n'
-        printf '[0] 返回主菜单\n'
-        read -rp '请选择：' choice || return 0
-        case "$choice" in
-            1) maintenance_run system_report; pause_screen ;;
-            2) bbr_menu ;;
-            3) swap_menu ;;
-            4) docker_menu ;;
-            5) maintenance_run configure_journal_limits; pause_screen ;;
-            6) maintenance_run set_timezone; pause_screen ;;
-            7) maintenance_run safe_cleanup; pause_screen ;;
-            8) maintenance_run install_monitor_timer; pause_screen ;;
-            0) return 0 ;;
-            *) warn "无效选择。"; pause_screen ;;
-        esac
-    done
-}
-
 hardening_menu() {
     local choice
     while true; do
@@ -2190,16 +2160,30 @@ main_menu() {
         printf '[1] 密钥登录与账号加固      [%s]\n' "$(hardening_summary)"
         printf '[2] SSH 固定随机端口        [%s]\n' "$(state_get PORT_STAGE 2>/dev/null || printf 未开始)"
         printf '[3] Fail2ban 防爆破         [%s]\n' "$(fail2ban_summary)"
-        printf '[4] 系统调优与维护          [按需使用]\n'
+        printf '[4] 系统现状体检（只读）\n'
+        printf '[5] BBR 管理（系统 BBR / XanMod + BBRv3）\n'
+        printf '[6] 内存与 Swap 管理（zRAM / 磁盘 Swap）\n'
+        printf '[7] Docker 与 Compose 管理\n'
+        printf '[8] 配置 journald 容量与保留期限\n'
+        printf '[9] 设置 Asia/Shanghai 时区\n'
+        printf '[10] 安全清理（逐项预览确认）\n'
+        printf '[11] 安装每周只读磁盘监控\n'
         printf '[0] 退出\n'
         printf '==================================================\n'
-        printf '安全开荒推荐顺序：1 → 测试密钥 → 2 → 测试新端口 → 3；系统维护按需进入 4\n'
+        printf '安全开荒推荐顺序：1 → 测试密钥 → 2 → 测试新端口 → 3；其余功能按需使用\n'
         read -rp '请选择：' choice || return 0
         case "$choice" in
             1) hardening_menu ;;
             2) port_menu ;;
             3) fail2ban_menu ;;
-            4) maintenance_menu ;;
+            4) maintenance_run system_report; pause_screen ;;
+            5) bbr_menu ;;
+            6) swap_menu ;;
+            7) docker_menu ;;
+            8) maintenance_run configure_journal_limits; pause_screen ;;
+            9) maintenance_run set_timezone; pause_screen ;;
+            10) maintenance_run safe_cleanup; pause_screen ;;
+            11) maintenance_run install_monitor_timer; pause_screen ;;
             0) return 0 ;;
             *) warn "无效选择。"; pause_screen ;;
         esac
