@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
 BACKUP_ROOT="/var/backups/vps-init"
@@ -1205,16 +1205,16 @@ main_menu() {
         printf '当前用户：root\n'
         printf 'SSH 端口：%s\n\n' "$(ports_csv)"
         printf '[1] 密钥登录与账号加固      [%s]\n' "$(hardening_summary)"
-        printf '[2] Fail2ban 防爆破         [%s]\n' "$(fail2ban_summary)"
-        printf '[3] SSH 固定随机端口        [%s]\n' "$(state_get PORT_STAGE 2>/dev/null || printf 未开始)"
+        printf '[2] SSH 固定随机端口        [%s]\n' "$(state_get PORT_STAGE 2>/dev/null || printf 未开始)"
+        printf '[3] Fail2ban 防爆破         [%s]\n' "$(fail2ban_summary)"
         printf '[0] 退出\n'
         printf '==================================================\n'
-        printf '推荐顺序：1 → 测试密钥 → 3 → 测试新端口 → 2\n'
+        printf '推荐顺序：1 → 测试密钥 → 2 → 测试新端口 → 3\n'
         read -rp '请选择：' choice || return 0
         case "$choice" in
             1) hardening_menu ;;
-            2) fail2ban_menu ;;
-            3) port_menu ;;
+            2) port_menu ;;
+            3) fail2ban_menu ;;
             0) return 0 ;;
             *) warn "无效选择。"; pause_screen ;;
         esac
