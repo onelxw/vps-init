@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
 BACKUP_ROOT="/var/backups/vps-init"
@@ -613,10 +613,28 @@ EOF
 }
 
 restart_fail2ban() {
+    local attempt
     fail2ban-client -t
     systemctl enable fail2ban >/dev/null
     systemctl restart fail2ban
-    fail2ban-client status sshd >/dev/null
+
+    # systemctl may return before fail2ban-server creates its control socket.
+    # Wait up to 10 seconds instead of treating that short startup window as a
+    # configuration failure.
+    for ((attempt = 1; attempt <= 20; attempt++)); do
+        if fail2ban-client ping >/dev/null 2>&1 && fail2ban-client status sshd >/dev/null 2>&1; then
+            return 0
+        fi
+        if systemctl is-failed --quiet fail2ban; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    error "Fail2ban 未能在 10 秒内进入可用状态。"
+    systemctl --no-pager --full status fail2ban 2>&1 || true
+    journalctl -u fail2ban --no-pager -n 30 2>&1 || true
+    return 1
 }
 
 sync_fail2ban_ports() {
