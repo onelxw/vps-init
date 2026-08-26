@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
@@ -1872,11 +1872,12 @@ show_container_log_configs() {
 
 journal_size_is_valid() {
     local value="${1^^}"
-    [[ "$value" =~ ^[1-9][0-9]*([KMGTPE])?$ ]]
+    [[ "$value" =~ ^[1-9][0-9]*[KMGTPE]$ ]]
 }
 
 journal_timespan_is_valid() {
     local value="$1"
+    [[ "$value" =~ [[:alpha:]] ]] || return 1
     systemd-analyze timespan "$value" >/dev/null 2>&1
 }
 
@@ -1889,21 +1890,21 @@ configure_journal_limits() {
         read -r -p "Journal最大占用 [500M]: " max_use || return 0
         max_use=${max_use:-500M}
         journal_size_is_valid "$max_use" && break
-        warn "容量格式无效，请输入正整数加可选单位 K/M/G/T/P/E，例如 500M 或 1G。"
+        warn "容量必须带单位 K/M/G/T/P/E，例如 500M 或 1G；不能只输入数字。"
     done
 
     while true; do
         read -r -p "最长保留时间 [30day]: " retention || return 0
         retention=${retention:-30day}
         journal_timespan_is_valid "$retention" && break
-        warn "时间格式无效，例如可输入 7day、30day、12h 或 2week。"
+        warn "时间必须带单位，例如 7day、30day、12h 或 2week；不能只输入数字。"
     done
 
     while true; do
         read -r -p "至少为系统保留磁盘空间 [1G]: " keep_free || return 0
         keep_free=${keep_free:-1G}
         journal_size_is_valid "$keep_free" && break
-        warn "容量格式无效，请输入正整数加可选单位 K/M/G/T/P/E，例如 500M 或 1G。"
+        warn "容量必须带单位 K/M/G/T/P/E，例如 500M 或 1G；不能只输入数字。"
     done
 
     printf '\n将设置：最大占用=%s，最长保留=%s，磁盘保留=%s\n' "$max_use" "$retention" "$keep_free"
