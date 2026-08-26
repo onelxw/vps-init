@@ -141,7 +141,3 @@ Docker：   /etc/docker/daemon.json
 - 不要把私钥、Token、密码、服务器日志或备份提交到仓库。
 - 修改 SSH 端口和 Fail2ban 主要减少扫描与爆破噪音，不能代替系统更新、公钥保护和最小权限管理。
 - BBR、zRAM、Swap 和 Docker 参数没有适合所有 VPS 的统一最优值，请根据内存、磁盘和业务负载选择。
-
-## 来源说明
-
-系统调优与维护功能整合自同一作者的 `onelxw/vpsgood`。相关来源和上游许可注意事项保留在 [NOTICE.md](NOTICE.md)。
