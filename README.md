@@ -7,6 +7,20 @@
 > [!WARNING]
 > SSH、内核、防火墙和 Swap 配置错误可能造成失联或无法启动。使用前请确认 VPS 厂商提供网页控制台或救援模式，最好先创建快照；修改 SSH 时不要关闭当前会话。
 
+## 一键运行
+
+```bash
+tmp_script=$(mktemp) && { curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/onelxw/vps-init/main/vps-init.sh -o "$tmp_script" && { if [ "$(id -u)" -eq 0 ]; then bash "$tmp_script"; else sudo bash "$tmp_script"; fi; }; result=$?; rm -f "$tmp_script"; (exit "$result"); }
+```
+
+该命令先下载到临时文件，运行结束后自动删除；root 用户直接执行，普通 sudo 管理员会自动使用 `sudo`。它每次获取 `main` 分支的最新版本，重要服务器执行前建议先查看仓库中的脚本内容。
+
+如果系统还没有 `curl`，先安装：
+
+```bash
+apt update && apt install -y curl
+```
+
 ## 主菜单
 
 ```text
@@ -198,21 +212,7 @@ HDD 上的 Swap 明显慢于 SSD/NVMe，但作为低优先级、低频使用的 
 
 ## 下载和运行
 
-一键下载最新版并启动交互菜单：
-
-```bash
-tmp_script=$(mktemp) && { curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/onelxw/vps-init/main/vps-init.sh -o "$tmp_script" && { if [ "$(id -u)" -eq 0 ]; then bash "$tmp_script"; else sudo bash "$tmp_script"; fi; }; result=$?; rm -f "$tmp_script"; (exit "$result"); }
-```
-
-该命令先下载到临时文件，运行结束后自动删除；root 用户直接执行，普通 sudo 管理员会自动使用 `sudo`。它每次获取 `main` 分支的最新版本，重要服务器执行前建议先查看仓库中的脚本内容。
-
-如果系统还没有 `curl`，先安装：
-
-```bash
-apt update && apt install -y curl
-```
-
-也可以下载后再运行：
+下载后再运行：
 
 ```bash
 sudo -i
