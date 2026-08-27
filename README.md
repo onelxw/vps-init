@@ -62,18 +62,131 @@ SSH 端口：22
 - 10 分钟内失败 5 次后封禁，首次 1 小时，重复攻击逐步延长，最长 7 天。
 - 支持查看状态、查看封禁 IP、手动解封和恢复上次配置。
 
-### 4–11. 系统调优与维护
+### 4. 系统现状体检（只读）
 
-- `[4]` 查看系统、磁盘、内存、Swap、Docker、BBR 与日志占用（只读）。
-- `[5]` 启用当前内核 BBR + FQ，或按需安装 XanMod + BBRv3。
-- `[6]` 配置 zRAM、创建低优先级磁盘 Swap、设置 `vm.swappiness`。
-- `[7]` 从 Docker 官方仓库安装或更新 Docker 与 Compose，安全合并日志轮转配置，查看容器日志配置，或仅卸载程序并保留数据。
-- `[8]` 限制 journald 最大占用与保留期限。
-- `[9]` 设置 `Asia/Shanghai` 时区。
-- `[10]` 逐项预览并确认 APT 缓存、无用包和 Docker 悬空镜像清理。
-- `[11]` 安装每周一 06:06 执行的只读磁盘监控定时器。
+- 显示操作系统、当前内核和时区。
+- 检查当前 TCP 拥塞控制算法与默认队列算法，即 BBR/FQ 状态。
+- 显示物理内存、`vm.swappiness`、zRAM 和磁盘 Swap。
+- 检查根文件系统、块设备类型、虚拟化类型和磁盘占用。
+- 显示 Docker 版本、实际日志驱动与 Docker 数据占用。
+- 显示 journald 和 APT 缓存占用。
 
-安装 XanMod 内核前请准备快照和控制台。脚本保留原发行版内核且不会自动重启，但更换内核本身仍有启动风险。
+该功能只读取状态，不安装软件、不修改配置，也不执行清理，适合在调优前后对比。
+
+### 5. BBR 管理
+
+#### 当前内核 BBR + FQ
+
+- 检查当前内核是否真正提供 BBR；不支持时不会写入无效配置。
+- 搜索 `/etc/sysctl.conf` 和 `/etc/sysctl.d/` 中重复的 BBR、队列参数并提示冲突。
+- 写入独立的 `/etc/sysctl.d/99-vps-init-network.conf`，配置对整台服务器全局生效。
+- 设置 `net.ipv4.tcp_congestion_control=bbr` 和 `net.core.default_qdisc=fq`。
+- 应用后检查实际生效值；应用失败时恢复原文件。
+
+#### XanMod + BBRv3
+
+- 仅适用于能够自行更换内核的 Debian/Ubuntu x86_64 VPS。
+- OpenVZ、LXC、Docker、Podman、WSL 等不能自行更换宿主内核的环境会被拒绝。
+- 使用 XanMod 官方 APT 仓库与官方签名密钥，不执行远程检测脚本。
+- 根据本机 glibc 检测 x86-64 psABI 等级并选择匹配的软件包；无法可靠判断时使用最保守等级。
+- 默认推荐 XanMod LTS，也可选择 Main 稳定内核。
+- x86-64-v4 CPU 使用官方 x64v3 包，BBRv3 功能不受 CPU 包名影响。
+- 安装前检查 `/boot` 可用空间，并提示准备快照和厂商控制台/VNC。
+- 保留发行版原内核作为启动回退，不自动执行 `autoremove`。
+- 不自动重启；重启进入 XanMod 后，才会使用其内置的 Google BBRv3。
+
+普通发行版内核可以启用 BBR，但不能仅凭拥塞控制名称显示为 `bbr` 就认定它是 BBRv3。更换内核前请确认快照、控制台和救援模式可用。
+
+### 6. 内存与 Swap 管理
+
+#### zRAM
+
+- 安装 Debian/Ubuntu 官方 `zram-tools`。
+- 允许选择 zRAM 占物理内存的比例，范围为 10%–100%。
+- 使用 `lz4` 压缩算法，zRAM Swap 优先级为 100。
+- 保留已有磁盘 Swap 作为低优先级兜底，不会自动删除。
+- 启动失败时恢复原 zRAM 配置。
+- 不自动修改 `vm.swappiness`，需要时可在同一菜单中单独设置。
+
+#### 磁盘 Swap
+
+- 检测根文件系统、块设备旋转标志和虚拟化类型。
+- 云 VPS 无法确认宿主机真实介质时会明确提示，不把虚拟盘强行认定为 SSD。
+- 使用 `dd` 创建无空洞的 `/swapfile`，避免 `truncate` 或部分文件系统中 `fallocate` 的兼容问题。
+- 创建前检查现有文件、`fstab` 条目、输入范围和磁盘剩余空间。
+- 仅自动支持 ext2/3/4 与 XFS；Btrfs 等需要特殊处理的文件系统会拒绝自动创建。
+- 写入前备份并验证 `/etc/fstab`，失败时自动回滚并删除本次创建的无效文件。
+- 磁盘 Swap 优先级为 10，低于 zRAM 的 100，只作为最后兜底。
+- 不自动修改 `vm.swappiness`，也不会停用 zRAM。
+
+HDD 上的 Swap 明显慢于 SSD/NVMe，但作为低优先级、低频使用的 OOM 兜底仍有价值。云 VPS 显示的旋转标志来自虚拟块设备，不一定代表宿主机的真实硬盘类型。
+
+#### vm.swappiness
+
+- 允许设置内核支持的 0–200 范围。
+- 写入独立的 `/etc/sysctl.d/99-vps-init-memory.conf`。
+- 修改前显示其他文件中的重复设置，不会自动篡改这些文件。
+- 应用后检查实际值；如果被加载顺序更晚的配置覆盖，会自动回滚。
+- zRAM 与磁盘 Swap 共同受这个全局值影响，但两种 Swap 的使用顺序仍由优先级决定。
+
+常用参考值为 10（保守）、60（均衡）和 100（更积极使用 zRAM），具体应根据内存大小和实际负载选择。
+
+### 7. Docker 与 Compose 管理
+
+- 通过 Docker 官方 APT 仓库安装或更新 Docker Engine、Buildx 与 Compose 插件。
+- 不使用 `get.docker.com` 更新已有环境。
+- 配置日志轮转时合并而不是覆盖 `/etc/docker/daemon.json` 的其他字段。
+- 使用 `dockerd --validate` 检查临时配置，验证成功后才替换原文件并重启 Docker。
+- 可查看每个现有容器实际使用的日志驱动、日志文件和轮转参数。
+- 卸载时只删除 Docker 程序包，明确保留 `/var/lib/docker`、`/var/lib/containerd` 和现有配置。
+
+默认日志轮转建议：
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "3",
+    "compress": "true"
+  }
+}
+```
+
+全局日志配置只影响新建或重建的容器；现有容器仍保留创建时的设置。Compose 服务或 1Panel 应用中明确声明的 `logging` 配置优先级更高，应通过原 Compose/1Panel 配置重建，不要根据 `docker inspect` 猜测并自动重建。
+
+### 8. journald 容量与保留期限
+
+- 可设置 journald 最大占用、至少为系统保留的磁盘空间和最长保留期限。
+- 容量必须带单位，例如 `500M` 或 `1G`；时间必须带单位，例如 `12h`、`30day` 或 `2week`。
+- 默认建议最大占用 500M、至少保留 1G 磁盘、最长保留 30 天。
+- 写入独立的 `/etc/systemd/journald.conf.d/60-vps-init-limits.conf`。
+- 修改前创建备份，重启后检查服务状态。
+- 不执行 `journalctl --vacuum-time=1s`，不会立即清空现有系统日志。
+
+### 9. Asia/Shanghai 时区
+
+- 显示当前时区并请求确认。
+- 通过 systemd 将系统时区设置为 `Asia/Shanghai`。
+- 设置后再次读取并显示实际时区。
+
+### 10. 安全清理
+
+- 先显示 APT、journald 和 Docker 的当前占用。
+- `apt clean` 单独确认，只清理已下载的软件包缓存。
+- `apt autoremove --purge` 必须先模拟并显示计划删除的列表，再次确认后才执行。
+- Docker 只允许交互式清理悬空镜像。
+- 不清理 Docker volume，不执行 `docker image prune -a`。
+- 不截断 Docker 日志，不清空系统日志，也不清空 `/tmp`。
+
+### 11. 每周只读磁盘监控
+
+- 安装每周一 06:06 运行的 systemd timer。
+- 记录磁盘、APT、journald、Docker 占用和超大 Docker 日志。
+- 报告写入 `/var/log/vps-init-monitor.log`。
+- 定时任务只检查和记录，不自动删除任何文件。
+
+系统日志由 journald 自身轮转，普通日志由 logrotate 管理，临时文件由 systemd-tmpfiles 管理，Docker 日志使用 Docker 自带轮转。脚本不会定时执行 `apt autoremove`、镜像或 volume 清理、日志截断以及 `/tmp` 清空。
 
 ## 环境要求
 
