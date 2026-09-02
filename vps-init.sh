@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.1.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 STATE_DIR="/var/lib/vps-init"
 STATE_FILE="${STATE_DIR}/state"
@@ -212,6 +212,51 @@ effective_sshd_config() {
 effective_sshd_value() {
     local user="$1" key="$2"
     effective_sshd_config "$user" | awk -v wanted="$key" '$1 == wanted { print $2; exit }'
+}
+
+find_unmanaged_hardening_conflicts() {
+    local -a files=("$SSHD_MAIN")
+    local file
+
+    shopt -s nullglob
+    for file in "$SSHD_DROPIN_DIR"/*.conf; do
+        [[ "$file" == "$HARDENING_FILE" ]] || files+=("$file")
+    done
+    shopt -u nullglob
+
+    awk '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        {
+            key=tolower($1)
+            value=tolower($2)
+            conflict=0
+
+            if (key == "authenticationmethods" && value != "publickey") conflict=1
+            else if (key == "pubkeyauthentication" && value != "yes") conflict=1
+            else if (key == "passwordauthentication" && value != "no") conflict=1
+            else if (key == "kbdinteractiveauthentication" && value != "no") conflict=1
+            else if (key == "challengeresponseauthentication" && value != "no") conflict=1
+            else if (key == "permitemptypasswords" && value != "no") conflict=1
+            else if (key == "permitrootlogin" && value != "no") conflict=1
+
+            if (conflict) printf "%s:%d:%s\n", FILENAME, FNR, $0
+        }
+    ' "${files[@]}" 2>/dev/null || true
+}
+
+show_unmanaged_hardening_conflicts() {
+    local conflicts
+    conflicts="$(find_unmanaged_hardening_conflicts)"
+    if [[ -z "$conflicts" ]]; then
+        ok "未发现脚本管理范围外的 SSH 登录加固冲突。"
+        return 0
+    fi
+
+    warn "发现脚本管理范围外的潜在 SSH 登录冲突："
+    printf '%s\n' "$conflicts"
+    warn "脚本不会自动修改这些文件；当前是否安全仍以界面显示的 sshd 实际生效值为准。"
+    warn "以后若恢复、删除或重命名 00-vps-hardening.conf，这些设置可能重新生效。"
+    return 1
 }
 
 effective_ssh_ports() {
@@ -511,6 +556,8 @@ configure_key_hardening() {
         return 1
     }
 
+    show_unmanaged_hardening_conflicts || true
+
     select_admin_user
     configure_nopasswd_sudo "$SELECTED_USER" || return 1
     install_authorized_keys "$SELECTED_USER" || return 1
@@ -565,6 +612,8 @@ hardening_status() {
     else
         warn "SSH 密钥加固配置未完全生效。"
     fi
+    printf '\n'
+    show_unmanaged_hardening_conflicts || true
     if [[ "$admin" != root ]] && getent passwd "$admin" >/dev/null; then
         printf '\n管理员用户：%s\n' "$admin"
         sudo -l -U "$admin" 2>/dev/null || true
